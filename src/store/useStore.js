@@ -1,70 +1,105 @@
 import { create } from 'zustand'
 import { initialActiveAgents } from '../data/agents.js'
 
-const initialMessages = [
-  {
-    id: 1,
-    role: 'user',
-    text: "What's the status on GC-2041?",
-    ts: Date.now() - 120000,
-  },
-  {
-    id: 2,
-    role: 'gritclaw',
-    text: '🔵 GC-2041 is in transit — currently 62% through the Shanghai → Rotterdam leg. ETA April 8. Temp reading nominal at 4.2°C. No exceptions flagged. Carrier is Evergreen.',
-    ts: Date.now() - 118000,
-  },
-  {
-    id: 3,
-    role: 'user',
-    text: 'Any alerts I should know about?',
-    ts: Date.now() - 60000,
-  },
-  {
-    id: 4,
-    role: 'gritclaw',
-    text: '🟡 One active item: GC-2029 (Mumbai → Jebel Ali) is showing a delay — ETA revised forward by 6 hours. This is likely routing around the Hormuz situation. I\'ll flag anything else as it comes in.',
-    ts: Date.now() - 58000,
-  },
-]
+// OpenClaw gateway config
+const GATEWAY_URL = 'https://0mfa14wrnr9vpej.gritcargo.verascient.com'
+const GATEWAY_TOKEN = '18f955e874699caa3262dc286471b511249453a1622cbd5a2cf4d65893888d93'
 
-const cannedResponses = [
-  "I'm monitoring all 8 active shipments. No critical exceptions right now.",
-  '🔴 ThermoWatch flagged GC-2033 earlier — temp holding at -18.4°C, within tolerance.',
-  'Want me to pull the full exception report for any specific shipment?',
-  'ETAOracle is predicting smooth transit for the Rotterdam-bound cargo. Should arrive on schedule.',
-  "I'm on it. Give me a moment to check the latest telemetry...",
-]
-
-let cannedIndex = 0
+const initialMessages = []
 
 export const useStore = create((set, get) => ({
   // Chat
   messages: initialMessages,
   isTyping: false,
-  addMessage: (text) => {
+
+  addMessage: async (text) => {
     const userMsg = {
       id: Date.now(),
       role: 'user',
       text,
       ts: Date.now(),
     }
+
     set((state) => ({ messages: [...state.messages, userMsg], isTyping: true }))
 
-    setTimeout(() => {
-      const response = cannedResponses[cannedIndex % cannedResponses.length]
-      cannedIndex++
-      const botMsg = {
-        id: Date.now() + 1,
-        role: 'gritclaw',
-        text: response,
-        ts: Date.now(),
-      }
+    // Build message history for context (last 20 messages)
+    const history = get().messages.map((m) => ({
+      role: m.role === 'user' ? 'user' : 'assistant',
+      content: m.text,
+    }))
+    history.push({ role: 'user', content: text })
+
+    const botId = Date.now() + 1
+    const botMsg = { id: botId, role: 'gritclaw', text: '', ts: Date.now() }
+
+    try {
+      const resp = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${GATEWAY_TOKEN}`,
+        },
+        body: JSON.stringify({
+          model: 'openclaw/default',
+          stream: true,
+          messages: history,
+        }),
+      })
+
+      if (!resp.ok) throw new Error(`Gateway error ${resp.status}`)
+
+      // Add empty bot message and start streaming into it
       set((state) => ({
         messages: [...state.messages, botMsg],
         isTyping: false,
       }))
-    }, 1000)
+
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() // keep incomplete line
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed.startsWith('data:')) continue
+          const data = trimmed.slice(5).trim()
+          if (data === '[DONE]') break
+          try {
+            const json = JSON.parse(data)
+            const delta = json.choices?.[0]?.delta?.content
+            if (delta) {
+              set((state) => ({
+                messages: state.messages.map((m) =>
+                  m.id === botId ? { ...m, text: m.text + delta } : m
+                ),
+              }))
+            }
+          } catch {
+            // skip malformed chunks
+          }
+        }
+      }
+    } catch (err) {
+      // On error, show a fallback message
+      set((state) => ({
+        messages: state.messages.some((m) => m.id === botId)
+          ? state.messages.map((m) =>
+              m.id === botId
+                ? { ...m, text: "Sorry, I couldn't reach the gateway right now. Try again in a moment." }
+                : m
+            )
+          : [
+              ...state.messages,
+              { id: botId, role: 'gritclaw', text: "Sorry, I couldn't reach the gateway right now. Try again in a moment.", ts: Date.now() },
+            ],
+        isTyping: false,
+      }))
+    }
   },
 
   // Agents

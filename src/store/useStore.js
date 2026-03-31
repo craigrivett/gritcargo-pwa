@@ -1,10 +1,6 @@
 import { create } from 'zustand'
 import { initialActiveAgents } from '../data/agents.js'
 
-// OpenClaw gateway config
-const GATEWAY_URL = 'https://0mfa14wrnr9vpej.gritcargo.verascient.com'
-const GATEWAY_TOKEN = '18f955e874699caa3262dc286471b511249453a1622cbd5a2cf4d65893888d93'
-
 const initialMessages = []
 
 export const useStore = create((set, get) => ({
@@ -22,33 +18,22 @@ export const useStore = create((set, get) => ({
 
     set((state) => ({ messages: [...state.messages, userMsg], isTyping: true }))
 
-    // Build message history for context (last 20 messages)
-    const history = get().messages.map((m) => ({
-      role: m.role === 'user' ? 'user' : 'assistant',
-      content: m.text,
-    }))
-    history.push({ role: 'user', content: text })
-
     const botId = Date.now() + 1
     const botMsg = { id: botId, role: 'gritclaw', text: '', ts: Date.now() }
 
+    // Build conversation history (last 20 messages)
+    const history = [...get().messages, userMsg].slice(-20)
+
     try {
-      const resp = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
+      const resp = await fetch('/api/chat', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${GATEWAY_TOKEN}`,
-        },
-        body: JSON.stringify({
-          model: 'openclaw/default',
-          stream: true,
-          messages: history,
-        }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: history }),
       })
 
-      if (!resp.ok) throw new Error(`Gateway error ${resp.status}`)
+      if (!resp.ok) throw new Error(`API error ${resp.status}`)
 
-      // Add empty bot message and start streaming into it
+      // Add empty bot message bubble, then stream into it
       set((state) => ({
         messages: [...state.messages, botMsg],
         isTyping: false,
@@ -63,7 +48,7 @@ export const useStore = create((set, get) => ({
         if (done) break
         buffer += decoder.decode(value, { stream: true })
         const lines = buffer.split('\n')
-        buffer = lines.pop() // keep incomplete line
+        buffer = lines.pop()
         for (const line of lines) {
           const trimmed = line.trim()
           if (!trimmed.startsWith('data:')) continue
@@ -85,17 +70,16 @@ export const useStore = create((set, get) => ({
         }
       }
     } catch (err) {
-      // On error, show a fallback message
       set((state) => ({
         messages: state.messages.some((m) => m.id === botId)
           ? state.messages.map((m) =>
               m.id === botId
-                ? { ...m, text: "Sorry, I couldn't reach the gateway right now. Try again in a moment." }
+                ? { ...m, text: "Couldn't reach me right now — try again in a moment." }
                 : m
             )
           : [
               ...state.messages,
-              { id: botId, role: 'gritclaw', text: "Sorry, I couldn't reach the gateway right now. Try again in a moment.", ts: Date.now() },
+              { id: botId, role: 'gritclaw', text: "Couldn't reach me right now — try again in a moment.", ts: Date.now() },
             ],
         isTyping: false,
       }))
